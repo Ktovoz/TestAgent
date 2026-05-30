@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 
 from skiritai.core.agent_loop import PERCEPTION_TOOLS
+from skiritai.core.tools import _OVERLAY_REMOVAL_SELECTORS
 from skiritai.logger import logger
 
 # Read-only tools that should never appear in replay scripts
@@ -172,7 +173,14 @@ def _action_to_line(action: str, args: dict) -> str | None:
         return f'    await page.locator("{_esc(args.get("selector", ""))}").fill("{_esc(args.get("text", ""))}", force=True)'
 
     if action == "type_text":
-        return f'    await page.locator("{_esc(args.get("selector", ""))}").press_sequentially("{_esc(args.get("text", ""))}", delay=50)'
+        sel = _esc(args.get("selector", ""))
+        txt = _esc(args.get("text", ""))
+        return (
+            f'    await page.locator("{sel}").click(force=True)\n'
+            f'    await page.keyboard.press("Control+a")\n'
+            f'    await page.keyboard.press("Backspace")\n'
+            f'    await page.locator("{sel}").press_sequentially("{txt}", delay=50)'
+        )
 
     if action == "focus":
         return f'    await page.locator("{_esc(args.get("selector", ""))}").focus()'
@@ -194,14 +202,15 @@ def _action_to_line(action: str, args: dict) -> str | None:
         return f"    result = await page.evaluate({repr(expr)})"
 
     if action == "dismiss_overlay":
+        selectors_js = ", ".join(f"'{s}'" for s in _OVERLAY_REMOVAL_SELECTORS)
         return (
             "    # Try Escape first\n"
             "    for _ in range(3):\n"
             "        await page.keyboard.press('Escape')\n"
             "        await asyncio.sleep(0.3)\n"
             "    # Then try clicking close buttons and removing overlays\n"
-            "    await page.evaluate(\"\"\"(() => {\n"
-            "        const overlays = document.querySelectorAll('[role=\"dialog\"], [id*=\"login\"], [id*=\"modal\"], [class*=\"overlay\"], [class*=\"mask\"], [class*=\"popup\"], [class*=\"modal\"], [class*=\"dialog\"]');\n"
+            f"    await page.evaluate(\"\"\"(() => {{\n"
+            f"        const overlays = document.querySelectorAll({selectors_js});\n"
             "        for (const el of overlays) {\n"
             "            const s = window.getComputedStyle(el);\n"
             "            if (s.display === 'none' || s.visibility === 'hidden') continue;\n"

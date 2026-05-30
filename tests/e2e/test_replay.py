@@ -146,9 +146,9 @@ class TestScriptRoundtrip:
             script = generate_replay_script("gen_test", agent_steps)
 
             assert "async def run(page, context):" in script
-            assert f'await page.goto("{url}")' in script
-            assert 'await page.fill("#text-input", "Generated")' in script
-            assert 'await page.click("#submit-btn")' in script
+            assert f'await page.goto("{url}", wait_until="domcontentloaded")' in script
+            assert 'page.locator("#text-input").fill("Generated", force=True)' in script
+            assert '_cdp_click' in script
 
             ai.scripts_dir.mkdir(parents=True, exist_ok=True)
             ai.script_path.write_text(script, encoding="utf-8")
@@ -219,11 +219,13 @@ class TestScriptRoundtrip:
 
         script = generate_replay_script("all_actions", agent_steps)
 
-        assert 'await page.goto("http://example.com")' in script
-        assert 'await page.click("#btn")' in script
+        assert 'await page.goto("http://example.com", wait_until="domcontentloaded")' in script
+        assert '_cdp_click' in script
         assert 'await page.click("#forced", force=True)' in script
-        assert 'await page.fill("#input", "hello")' in script
-        assert 'await page.locator("#slow").press_sequentially("world")' in script
+        assert 'page.locator("#input").fill("hello", force=True)' in script
+        assert 'await page.keyboard.press("Control+a")' in script
+        assert 'await page.keyboard.press("Backspace")' in script
+        assert 'await page.locator("#slow").press_sequentially("world", delay=50)' in script
         assert 'await page.locator("#focus").focus()' in script
         assert 'await page.wait_for_selector("#wait", timeout=3000)' in script
         assert "await page.mouse.wheel(0, 500)" in script
