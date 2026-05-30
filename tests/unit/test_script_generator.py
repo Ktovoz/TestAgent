@@ -16,7 +16,7 @@ class TestGenerateReplayScript:
         script = generate_replay_script("nav", [
             {"action": "navigate", "args": {"url": "https://example.com"}},
         ])
-        assert 'await page.goto("https://example.com")' in script
+        assert 'await page.goto("https://example.com", wait_until="domcontentloaded")' in script
         assert 'await page.wait_for_load_state("networkidle")' in script
 
     def test_perception_tools_are_filtered_out(self):
@@ -35,7 +35,8 @@ class TestGenerateReplayScript:
         assert "get_page_info" not in script
         assert "get_text" not in script
         assert "response" not in script
-        assert 'await page.click("#btn")' in script
+        assert '_cdp_click(page, _box)' in script
+        assert '#btn' in script
 
     def test_empty_steps_produces_pass(self):
         from skiritai.core.script_generator import generate_replay_script
@@ -110,13 +111,14 @@ class TestActionToLine:
     def test_navigate_with_url(self):
         from skiritai.core.script_generator import _action_to_line
         line = _action_to_line("navigate", {"url": "https://x.com"})
-        assert 'await page.goto("https://x.com")' in line
+        assert 'await page.goto("https://x.com", wait_until="domcontentloaded")' in line
         assert 'wait_for_load_state("networkidle")' in line
 
     def test_click_with_selector(self):
         from skiritai.core.script_generator import _action_to_line
         line = _action_to_line("click", {"selector": "#submit"})
-        assert 'await page.click("#submit")' in line
+        assert '_cdp_click(page, _box)' in line
+        assert '#submit' in line
 
     def test_click_no_networkidle(self):
         from skiritai.core.script_generator import _action_to_line
@@ -126,7 +128,8 @@ class TestActionToLine:
     def test_click_text(self):
         from skiritai.core.script_generator import _action_to_line
         line = _action_to_line("click_text", {"text": "百度一下"})
-        assert 'page.get_by_text("百度一下").first.click()' in line
+        assert 'page.get_by_text("百度一下")' in line
+        assert "_cdp_click" in line
         assert "networkidle" not in line
 
     def test_click_force(self):
@@ -138,12 +141,12 @@ class TestActionToLine:
     def test_fill_with_text(self):
         from skiritai.core.script_generator import _action_to_line
         line = _action_to_line("fill", {"selector": "#input", "text": "hello"})
-        assert 'await page.fill("#input", "hello")' in line
+        assert 'page.locator("#input").fill("hello", force=True)' in line
 
     def test_type_text(self):
         from skiritai.core.script_generator import _action_to_line
         line = _action_to_line("type_text", {"selector": "#slow", "text": "world"})
-        assert 'page.locator("#slow").press_sequentially("world")' in line
+        assert 'page.locator("#slow").press_sequentially("world", delay=50)' in line
 
     def test_focus(self):
         from skiritai.core.script_generator import _action_to_line
@@ -191,15 +194,11 @@ class TestActionToLine:
         line = _action_to_line("hover", {"selector": "#menu"})
         assert 'page.hover("#menu")' in line
 
-    def test_screenshot(self):
+    def test_screenshot_filtered_out(self):
+        """screenshot is a perception tool — _action_to_line returns None."""
         from skiritai.core.script_generator import _action_to_line
         line = _action_to_line("screenshot", {"name": "step1"})
-        assert 'page.screenshot(path="step1.png", full_page=True)' in line
-
-    def test_screenshot_default_name(self):
-        from skiritai.core.script_generator import _action_to_line
-        line = _action_to_line("screenshot", {})
-        assert 'screenshot.png' in line
+        assert line is None
 
     def test_unknown_action_returns_none(self):
         from skiritai.core.script_generator import _action_to_line
@@ -225,7 +224,7 @@ class TestActionToLine:
         from skiritai.core.script_generator import _action_to_line
         # fill without text should use empty string
         line = _action_to_line("fill", {"selector": "#x"})
-        assert 'page.fill("#x", "")' in line
+        assert 'page.locator("#x").fill("", force=True)' in line
 
 
 class TestEscaping:

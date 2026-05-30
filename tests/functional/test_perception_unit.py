@@ -175,9 +175,9 @@ def test_replay_script_generation():
     assert '__name__ == "__main__"' in script
 
     # Verify action steps are present
-    assert 'page.goto("https://www.baidu.com")' in script
-    assert 'page.fill("#kw", "hello world")' in script
-    assert 'page.click("#su")' in script
+    assert 'page.goto("https://www.baidu.com"' in script
+    assert 'page.locator("#kw").fill("hello world", force=True)' in script
+    assert '_cdp_click' in script and '#su' in script
 
     # Verify perception steps are NOT present
     assert "page_perceive" not in script

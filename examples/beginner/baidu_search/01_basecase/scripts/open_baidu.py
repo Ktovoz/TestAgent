@@ -4,7 +4,7 @@ from playwright.async_api import async_playwright
 
 
 async def run(page, context):
-    await page.goto("http://x.com")
+    await page.goto("https://www.baidu.com", wait_until="domcontentloaded")
     await page.wait_for_load_state("networkidle")
 
 

@@ -23,9 +23,8 @@ async def _cdp_click(page, box):
 
 
 async def run(page, context):
-    await page.goto("http://example.com", wait_until="domcontentloaded")
-    await page.wait_for_load_state("networkidle")
-    _loc = page.locator("#btn")
+    await page.locator("#chat-textarea").fill("Playwright 自动化测试", force=True)
+    _loc = page.get_by_text("百度一下").first
     await _loc.scroll_into_view_if_needed(timeout=5000)
     _box = await _loc.bounding_box()
     if _box:
@@ -37,7 +36,7 @@ async def run(page, context):
 if __name__ == "__main__":
     async def main():
         pw = await async_playwright().start()
-        browser = await pw.chromium.launch(headless=False)
+        browser = await pw.chromium.launch(headless=True)
         ctx = await browser.new_context()
         page = await ctx.new_page()
         try:

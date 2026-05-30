@@ -1,27 +1,19 @@
-"""抖音精选搜索 — flow() 函数式 API + 代码显式创建 Provider。
+"""抖音精选搜索 — flow() 函数式 API。
 
-用 flow() 函数式风格完成抖音搜索测试，同时在代码中显式配置 LLM。
+用 flow() 函数式风格完成抖音搜索测试。
 适合不需要 BaseCase 生命周期管理的场景。
 
 运行：
     python examples/advanced/douyin_search/02_flow/demo.py
 """
 import asyncio
-import os
 from pathlib import Path
 
 from skiritai import flow
-from skiritai.llm import OpenAIProvider
 
 
 async def main():
-    llm = OpenAIProvider(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_BASE_URL"),
-        model=os.getenv("LLM_MODEL", "gpt-4o"),
-    )
-
-    async with flow(results_dir=Path("results/douyin_flow"), llm=llm) as ai:
+    async with flow(results_dir=Path("results/douyin_flow")) as ai:
         # 打开首页
         await ai.action("打开 https://www.douyin.com/jingxuan 首页")
 
@@ -29,20 +21,17 @@ async def main():
         await ai.action("关闭页面上的登录弹窗")
         await ai.screenshot("homepage")
 
-        # 搜索流程
+        # 搜索
         await ai.action(
-            "在页面顶部中间位置找到搜索框，点击搜索框使其获得焦点，"
-            "然后输入关键词'陈伯全能王'，输入完成后按 Enter 键提交搜索。"
-            "确认页面已跳转到搜索结果页面。"
+            "先仔细观察页面结构，找到顶部导航区搜索框旁边的搜索按钮"
+            "（不是左侧导航栏的搜索链接），然后在搜索框中输入'陈伯全能王'，"
+            "点击搜索按钮"
         )
         await ai.screenshot("search_result")
 
-        # 验证搜索结果
-        result = await ai.verify("搜索结果页面显示了与'陈伯全能王'相关的内容")
-        print(f"搜索验证: {'PASS' if result['passed'] else 'FAIL'} — {result['reason']}")
-
-        # 截图保存最终状态
-        await ai.screenshot("final_state")
+        # 验证登录弹窗
+        result = await ai.verify("页面上弹出了登录弹窗或登录浮窗")
+        print(f"登录弹窗验证: {'PASS' if result['passed'] else 'FAIL'} — {result['reason']}")
 
 
 if __name__ == "__main__":

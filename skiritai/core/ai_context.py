@@ -37,6 +37,9 @@ _ALLOWED_AST_NODES = frozenset({
     ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
     ast.Is, ast.IsNot, ast.In, ast.NotIn,
     ast.And, ast.Or, ast.Not,
+    # Arithmetic operators (used in proximity-based element selection)
+    ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod, ast.FloorDiv,
+    ast.USub, ast.UAdd,
 })
 _FORBIDDEN_BUILTINS = frozenset({
     "exec", "eval", "compile", "open", "input",
@@ -48,6 +51,7 @@ _FORBIDDEN_BUILTINS = frozenset({
 # resolves these names (see _safe_import below).
 _SAFE_IMPORT_WHITELIST = frozenset({
     "asyncio", "playwright", "playwright.async_api",
+    "random",  # used by _cdp_click in replay scripts
 })
 # Attribute names that must not be accessed (prevents object introspection escapes)
 _FORBIDDEN_ATTRS = frozenset({
@@ -222,7 +226,19 @@ class AIContext:
         import base64
         import tempfile
         path = str(Path(tempfile.gettempdir()) / f"skiritai_{self.step_id}_{name}.png")
-        await self.page.screenshot(path=path, full_page=True)
+        try:
+            # full_page=False: avoid timeout on pages with slow font-loading / lazy content
+            await self.page.screenshot(path=path, full_page=False, timeout=15000)
+        except Exception:
+            # Fallback: CDP screenshot bypasses font-loading wait
+            import base64 as _b64
+            try:
+                cdp = await self.page.context.new_cdp_session(self.page)
+                result = await cdp.send("Page.captureScreenshot", {"format": "png"})
+                with open(path, "wb") as f:
+                    f.write(_b64.b64decode(result["data"]))
+            except Exception:
+                logger.warning(f"[Screenshot] CDP fallback also failed for {name}")
         self._screenshots.append({"name": name, "path": path, "timestamp": self._step_started_at})
         self._ops.append("screenshot")
         logger.info(f"[Screenshot] {self.step_id}/{name} saved")
@@ -254,8 +270,44 @@ class AIContext:
         # Gather page state
         title = await self.page.title()
         url = self.page.url
+        # Build popup selector JS string from shared constant
+        from skiritai.core.tools import _POPUP_DETECT_SELECTORS
+        _popup_selectors_js = ", ".join(f'\'{s}\'' for s in _POPUP_DETECT_SELECTORS)
+
         try:
-            body_text = await self.page.evaluate("document.body?.innerText?.substring(0, 3000) || ''")
+            body_text = await self.page.evaluate(f"""(() => {{
+                // Include input/textarea values alongside body text so verify()
+                // can see what users have typed into form fields.
+                let text = document.body?.innerText?.substring(0, 2200) || '';
+                const inputs = document.querySelectorAll('input, textarea');
+                for (const inp of inputs) {{
+                    const val = (inp.value || '').trim();
+                    if (val && !text.includes(val)) {{
+                        const label = inp.placeholder || inp.name || inp.id || inp.type || 'input';
+                        text += '\\n[输入框 ' + label + ': ' + val + ']';
+                    }}
+                }}
+                // Detect visible popups/modals/overlays
+                const popupSelectors = [{_popup_selectors_js}];
+                const popups = [];
+                for (const sel of popupSelectors) {{
+                    document.querySelectorAll(sel).forEach(el => {{
+                        const s = window.getComputedStyle(el);
+                        if (s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0') {{
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width > 0 && rect.height > 0) {{
+                                const desc = el.id || el.className?.toString().substring(0, 40) || el.tagName;
+                                const inner = (el.innerText || '').substring(0, 100).trim();
+                                popups.push(desc + (inner ? ': ' + inner : ''));
+                            }}
+                        }}
+                    }});
+                }}
+                if (popups.length) {{
+                    text += '\\n[可见弹窗/浮层: ' + popups.join('; ') + ']';
+                }}
+                return text.substring(0, 3000);
+            }})()""")
         except Exception:
             body_text = ""
 
@@ -271,7 +323,7 @@ class AIContext:
                 f"你是一个断言验证器。根据当前页面状态判断以下断言是否为真。\n\n"
                 f"页面 URL: {url}\n"
                 f"页面标题: {title}\n"
-                f"页面文本（前3000字符）:\n{body_text}\n\n"
+                f"页面文本（前3000字符，其中 [输入框 ...] 标记为表单输入框的当前值，[可见弹窗/浮层 ...] 标记为页面上的弹出层）:\n{body_text}\n\n"
                 f"断言: {assertion}\n\n"
                 f"仅回复 JSON: {{\"passed\": true/false, \"reason\": \"判断理由\"}}"
             )
@@ -281,7 +333,8 @@ class AIContext:
                 f"based on the current page state.\n\n"
                 f"Page URL: {url}\n"
                 f"Page Title: {title}\n"
-                f"Page Text (first 3000 chars):\n{body_text}\n\n"
+                f"Page Text (first 3000 chars; lines starting with [输入框 ...] show form input values, "
+                f"[可见弹窗/浮层 ...] shows visible popups/overlays):\n{body_text}\n\n"
                 f"Assertion: {assertion}\n\n"
                 f"Reply with JSON only: {{\"passed\": true/false, \"reason\": \"brief explanation\"}}"
             )
@@ -424,6 +477,11 @@ class AIContext:
 
         Validates integrity (SHA256 hash) and structure (AST whitelist) before
         execution. Uses a restricted builtins namespace to sandbox the script.
+
+        After execution, performs a lightweight page-change check: if the script
+        contains click/fill/navigate actions but the page URL and visible text
+        hash are unchanged, logs a low-confidence warning. In auto mode, this
+        triggers the explore fallback so the step can be re-attempted.
         """
         logger.info(f"[Replay] {self.step_id}: executing {self.script_path}")
 
@@ -433,6 +491,9 @@ class AIContext:
                 "summary": "回放脚本完整性校验失败 — 脚本可能已被篡改。请用 explore 模式重新生成。",
                 "steps": [],
             }
+
+        # Capture pre-execution URL for navigate verification
+        pre_url = self.page.url
 
         try:
             script_content = self.script_path.read_text(encoding="utf-8")
@@ -459,6 +520,35 @@ class AIContext:
 
             if "run" in exec_globals:
                 await exec_globals["run"](self.page, self.page.context)
+
+            # Post-execution verification: only check for navigate actions
+            # where a URL change is expected. For click/fill/etc., page text
+            # changes are too subtle for a reliable hash comparison.
+            has_navigate = "page.goto" in script_content or "page.navigate" in script_content
+            # Skip URL-change check when the script only navigates to the same
+            # URL the page was already on (e.g. an explore-injected goto).
+            # This avoids false-positive "URL did not change" warnings.
+            _same_url_goto = False
+            if has_navigate and pre_url and "about:blank" not in pre_url:
+                import re as _re
+                _goto_urls = _re.findall(r'page\.goto\("([^"]+)"', script_content)
+                _same_url_goto = all(u.rstrip("/") == pre_url.rstrip("/") for u in _goto_urls)
+            if has_navigate and not _same_url_goto:
+                try:
+                    post_url = self.page.url
+                    if post_url == pre_url and "about:blank" not in pre_url:
+                        logger.warning(
+                            f"[Replay] {self.step_id}: navigate executed without errors, "
+                            f"but URL did not change (still {pre_url}). "
+                            f"This may indicate the navigation did not take effect."
+                        )
+                        return {
+                            "success": False,
+                            "summary": "回放脚本导航执行成功但 URL 未变化",
+                            "steps": [{"action": "replay", "script": str(self.script_path)}],
+                        }
+                except Exception:
+                    pass  # verification is best-effort
 
             logger.info(f"[Replay] {self.step_id}: completed successfully")
             return {
@@ -491,6 +581,23 @@ class AIContext:
 
         if result.get("success"):
             script = generate_replay_script(self.step_id, result.get("steps", []))
+
+            # Patch: if the generated script has no navigation but the page is on a
+            # real URL (i.e. the agent found the page already loaded from a failed
+            # replay attempt), inject a page.goto() so subsequent replays work.
+            current_url = self.page.url
+            has_action = any(
+                kw in script
+                for kw in ("page.goto", "page.click", "page.fill", "page.get_by_text",
+                           "page.locator", "press_sequentially", "keyboard.press",
+                           "page.mouse.wheel", "page.evaluate")
+            )
+            if current_url and current_url != "about:blank" and not has_action:
+                from skiritai.core.script_generator import _esc
+                goto_line = f'    await page.goto("{_esc(current_url)}", wait_until="domcontentloaded")\n'
+                script = script.replace("    pass", goto_line, 1)
+                logger.info(f"[Explore] {self.step_id}: injected page.goto({current_url}) into replay script")
+
             self.script_path.write_text(script, encoding="utf-8")
             _save_script_hash(self.script_path, script)
             logger.info(f"[Explore] {self.step_id}: script saved to {self.script_path}")

@@ -93,9 +93,10 @@ class TestAIContext:
 
         script = generate_replay_script("test", agent_steps)
         assert "async def run(page, context):" in script
-        assert 'await page.goto("https://example.com")' in script
-        assert 'await page.click("#btn")' in script
-        assert 'await page.fill("#input", "hello")' in script
+        assert 'await page.goto("https://example.com", wait_until="domcontentloaded")' in script
+        assert '_cdp_click(page, _box)' in script
+        assert '#btn' in script
+        assert 'page.locator("#input").fill("hello", force=True)' in script
 
     def test_generate_script_empty_steps_produces_pass(self):
         from skiritai.core.script_generator import generate_replay_script
@@ -122,11 +123,11 @@ class TestAIContext:
         ]
 
         script = generate_replay_script("test", agent_steps)
-        assert 'await page.goto("http://a.com")' in script
-        assert 'await page.click("#b")' in script
+        assert 'await page.goto("http://a.com", wait_until="domcontentloaded")' in script
+        assert '_cdp_click' in script and '#b' in script
         assert 'await page.click("#c", force=True)' in script
-        assert 'await page.fill("#d", "t")' in script
-        assert 'await page.locator("#e").press_sequentially("x")' in script
+        assert 'page.locator("#d").fill("t", force=True)' in script
+        assert 'page.locator("#e").press_sequentially("x", delay=50)' in script
         assert 'await page.locator("#f").focus()' in script
         assert 'await page.wait_for_selector("#g", timeout=3000)' in script
         assert "await page.mouse.wheel(0, 500)" in script

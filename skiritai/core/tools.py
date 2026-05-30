@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json as _json
 import tempfile
 from pathlib import Path
 from typing import Any
 
+from skiritai.core.human_click import human_click
 from skiritai.core.llm_retry import _is_navigation_error
 from skiritai.core.tool_registry import register_tool
 from skiritai.logger import logger
@@ -16,9 +18,111 @@ _browser_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("_browser_ctx
 _context_ctx: contextvars.ContextVar[Any] = contextvars.ContextVar("_context_ctx", default=None)
 
 # Callback invoked when configure_browser replaces the context/page.
-# BrowserSession registers this to keep its internal refs in sync.
-# Uses single-callback overwrite to avoid duplicate registration on start/stop cycles.
 _on_context_replaced: Any = None
+
+# Track last interacted element for proximity-based disambiguation
+_last_interacted_selector: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_last_interacted_selector", default=""
+)
+
+# ── Shared popup/overlay selector lists ──────────────────────────────────
+# Used by _check_post_click_popup, click(), click_text(), type_text(),
+# dismiss_overlay, and ai_context.py verify().  Single source of truth.
+
+_POPUP_DETECT_SELECTORS = [
+    '[id*="login"]', '[class*="login-popup"]', '[class*="login-modal"]',
+    '[id*="modal"]', '[id*="popup"]', '[class*="overlay"]',
+    '[class*="mask"]', '[class*="modal"]', '[class*="popup"]',
+    '[class*="dialog"]', '[role="dialog"]',
+    '[class*="Login"]', '[class*="semi-modal"]', '[class*="semi-dialog"]',
+    '[class*="semi-popup"]', '[data-testid*="login"]', '[data-testid*="modal"]',
+    '.login-guide', '.login-panel', '#login-guide', '#login-panel',
+]
+
+_OVERLAY_REMOVAL_SELECTORS = [
+    '[id*="login"]', '[id*="modal"]', '[id*="popup"]',
+    '[class*="overlay"]', '[class*="mask"]', '[class*="modal"]',
+    '[class*="popup"]', '[class*="dialog"]', '[class*="interstitial"]',
+    '[role="dialog"]',
+]
+
+
+def _popup_detect_js() -> str:
+    """Return JS IIFE that returns descriptions of visible popup elements, or null."""
+    selectors_js = ", ".join(f'\'{s}\'' for s in _POPUP_DETECT_SELECTORS)
+    return (
+        "(() => {"
+        f"  const popupSelectors = [{selectors_js}];"
+        "    const found = [];"
+        "    for (const sel of popupSelectors) {"
+        "        document.querySelectorAll(sel).forEach(el => {"
+        "            const s = window.getComputedStyle(el);"
+        "            if (s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0') {"
+        "                const rect = el.getBoundingClientRect();"
+        "                if (rect.width > 0 && rect.height > 0) {"
+        "                    found.push('detected:' + (el.id || el.className?.toString().substring(0, 30)));"
+        "                }"
+        "            }"
+        "        });"
+        "    }"
+        "    return found.length ? found.join('; ') : null;"
+        "})()"
+    )
+
+
+def _overlay_removal_js() -> str:
+    """Return JS IIFE that removes visible overlay/popup elements and restores body scroll."""
+    selectors_js = ", ".join(f'\'{s}\'' for s in _OVERLAY_REMOVAL_SELECTORS)
+    return (
+        "(() => {"
+        f"    const selectors = [{selectors_js}];"
+        "    for (const sel of selectors) {"
+        "        document.querySelectorAll(sel).forEach(el => {"
+        "            const style = window.getComputedStyle(el);"
+        "            if (style.display !== 'none' && style.visibility !== 'hidden') {"
+        "                el.remove();"
+        "            }"
+        "        });"
+        "    }"
+        "    document.body.style.overflow = '';"
+        "})()"
+    )
+
+
+async def _remove_overlays(page: Any) -> None:
+    """Remove visible overlay/popup elements from the page."""
+    await safe_evaluate(page, _overlay_removal_js())
+    await asyncio.sleep(0.3)
+
+
+def _record_interaction(selector: str) -> None:
+    if selector:
+        _last_interacted_selector.set(selector)
+
+
+async def _check_post_click_popup(page: Any) -> str | None:
+    """After a click, check if a popup (login, modal) appeared.
+
+    Returns a description of what was found, or None.
+    Only restores body scroll-lock; does NOT auto-close/remove popups so that
+    subsequent verify() steps can assert their presence.
+    """
+    # Wait for popup to appear — some SPAs render popups asynchronously.
+    # Early exit: stop checking once a popup is detected.
+    for wait_ms in (500, 1000, 1500):
+        await asyncio.sleep(wait_ms / 1000)
+        try:
+            result = await safe_evaluate(page, _popup_detect_js())
+            if result:
+                logger.info(f"[click] Post-click popup detected: {result}")
+                return result
+            # No popup detected after this round — no need to keep waiting
+            # if the first check (500ms) found nothing.
+            if wait_ms == 500:
+                return None
+        except Exception as e:
+            logger.debug(f"[click] Post-click popup check failed: {e}")
+    return None
 
 
 def set_page(page: Any):
@@ -96,28 +200,182 @@ async def click(selector: str) -> str:
     """点击页面元素。使用 CSS 选择器定位元素。
 
     Args:
-        selector: CSS 选择器，如 'button#submit', '.login-btn', 'text=登录'
+        selector: CSS 选择器，如 'button#submit', '.login-btn'
     """
     page = get_page()
-    await page.locator(selector).click()
+    locator = page.locator(selector)
+    try:
+        ok = await human_click(page, locator)
+        if not ok:
+            raise RuntimeError(f"human_click returned False for '{selector}'")
+    except Exception as e:
+        err = str(e)
+        if "intercept" in err.lower() or "timed out" in err.lower() or "no bounding box" in err.lower():
+            logger.warning(f"[click] Click failed for '{selector}': removing overlays...")
+            try:
+                await _remove_overlays(page)
+                ok = await human_click(page, locator)
+                if not ok:
+                    raise RuntimeError("human_click returned False after overlay removal")
+                _record_interaction(selector)
+                return f"已点击元素: {selector}（已自动移除遮挡元素）"
+            except Exception:
+                logger.warning(f"[click] Overlay removal didn't resolve, trying force click...")
+                await locator.click(force=True, timeout=3000)
+                _record_interaction(selector)
+                return f"已点击元素: {selector}（已自动使用 force 模式）"
+        raise
+    _record_interaction(selector)
+    # Check if click triggered a popup (e.g. login wall) — that means click succeeded
+    popup = await _check_post_click_popup(page)
+    if popup:
+        return f"已点击元素: {selector}（点击触发了弹窗: {popup}）"
     return f"已点击元素: {selector}"
 
 
+async def _resolve_text_locator(page, text: str, timeout: int, near: str = ""):
+    """Find the best locator for a text match, using proximity when *near* is given."""
+    if not near:
+        near = _last_interacted_selector.get("")
+    logger.info(f"[click_text] _resolve_text_locator: text='{text}', near='{near}', last_selector='{_last_interacted_selector.get('')}'")
+    if near:
+        matches = page.get_by_text(text, exact=False)
+        try:
+            await matches.first.wait_for(timeout=timeout or 5000)
+        except Exception:
+            raise
+        count = await matches.count()
+        if count <= 1:
+            return matches.first
+        ref_box = await page.locator(near).first.bounding_box()
+        if not ref_box:
+            logger.warning(f"[click_text] near element '{near}' has no bounding box, using first match")
+            return matches.first
+        ref_cx = ref_box["x"] + ref_box["width"] / 2
+        ref_cy = ref_box["y"] + ref_box["height"] / 2
+        best_idx = 0
+        best_dist = float("inf")
+        for i in range(count):
+            box = await matches.nth(i).bounding_box()
+            if box:
+                cx = box["x"] + box["width"] / 2
+                cy = box["y"] + box["height"] / 2
+                dist = ((cx - ref_cx) ** 2 + (cy - ref_cy) ** 2) ** 0.5
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = i
+        logger.info(f"[click_text] near='{near}': picked index {best_idx}/{count} "
+                     f"(distance={best_dist:.0f}px) for text='{text}'")
+        return matches.nth(best_idx)
+    # No near — prefer button elements over links when multiple matches exist
+    exact_matches = page.get_by_text(text, exact=True)
+    partial_matches = page.get_by_text(text, exact=False)
+    matches = exact_matches
+    try:
+        await matches.first.wait_for(timeout=min(timeout or 5000, 2000))
+    except Exception:
+        matches = partial_matches
+        if timeout:
+            await matches.first.wait_for(timeout=timeout)
+
+    count = await matches.count()
+    if count <= 1:
+        return matches.first
+
+    # Multiple matches: prefer <button> > [role="button"] > <a> > other
+    # Also check ancestor elements since get_by_text often matches inner spans
+    # When priority ties, prefer elements closer to visible input fields (spatial context)
+    best_idx = 0
+    best_priority = 99
+    best_score = float("inf")
+    for i in range(count):
+        el = matches.nth(i)
+        result = await el.evaluate("""el => {
+            // Walk up to find the closest interactive ancestor (or self)
+            let node = el;
+            let priority = 3;
+            for (let depth = 0; depth < 3 && node; depth++) {
+                const tag = node.tagName.toLowerCase();
+                const role = (node.getAttribute('role') || '').toLowerCase();
+                const cursor = window.getComputedStyle(node).cursor;
+                if (tag === 'button') { priority = 0; break; }
+                if (role === 'button') { priority = 1; break; }
+                if (tag === 'a') { priority = 2; break; }
+                if (cursor === 'pointer') { priority = 1.5; break; }
+                node = node.parentElement;
+            }
+            // Spatial context: distance to nearest visible input field
+            const elRect = el.getBoundingClientRect();
+            const elCx = elRect.x + elRect.width / 2;
+            const elCy = elRect.y + elRect.height / 2;
+            let minDist = 99999;
+            document.querySelectorAll('input, textarea').forEach(inp => {
+                const s = window.getComputedStyle(inp);
+                if (s.display === 'none' || s.visibility === 'hidden') return;
+                const r = inp.getBoundingClientRect();
+                if (r.width === 0 || r.height === 0) return;
+                const dx = (r.x + r.width / 2) - elCx;
+                const dy = (r.y + r.height / 2) - elCy;
+                const d = Math.sqrt(dx * dx + dy * dy);
+                if (d < minDist) minDist = d;
+            });
+            return JSON.stringify({priority, dist: minDist});
+        }""")
+        try:
+            info = _json.loads(result)
+            priority = info["priority"]
+            dist = info.get("dist", 99999)
+        except Exception:
+            priority = 3
+            dist = 99999
+
+        # Better = lower priority; on ties, prefer closer to an input field
+        if priority < best_priority or (priority == best_priority and dist < best_score):
+            best_priority = priority
+            best_score = dist
+            best_idx = i
+    logger.info(f"[click_text] no near: picked index {best_idx}/{count} "
+                 f"(priority={best_priority}, input_dist={best_score:.0f}px) for text='{text}'")
+    return matches.nth(best_idx)
+
+
 @register_tool
-async def click_text(text: str, timeout: int = 5000) -> str:
+async def click_text(text: str, timeout: int = 5000, near: str = "") -> str:
     """通过可见文本点击元素。不需要知道 CSS 选择器，直接根据页面上显示的文字来点击。
 
     适用场景：点击按钮、链接、菜单项等。会匹配包含该文本的第一个可见元素。
+    当页面上有多个同名元素时，使用 near 参数指定参考元素的 selector，
+    工具会自动选择距离参考元素最近的匹配项。
 
     Args:
         text: 页面上可见的文字内容，如 '登录'、'GCC Installation'
         timeout: 等待元素出现的超时时间（毫秒），默认 5000。设为 0 表示不超时。
+        near: 参考元素的 CSS 选择器，用于就近定位。当有多个同名元素时选择距离此元素最近的。
     """
     page = get_page()
-    locator = page.get_by_text(text, exact=False).first
-    if timeout:
-        await locator.wait_for(timeout=timeout)
-    await locator.click()
+    locator = await _resolve_text_locator(page, text, timeout, near)
+    try:
+        ok = await human_click(page, locator)
+        if not ok:
+            raise RuntimeError(f"human_click returned False for text '{text}'")
+    except Exception as e:
+        err = str(e)
+        if "intercept" in err.lower() or "timed out" in err.lower() or "no bounding box" in err.lower():
+            logger.warning(f"[click_text] Click failed for '{text}': removing overlays...")
+            try:
+                await _remove_overlays(page)
+                ok = await human_click(page, locator)
+                if not ok:
+                    raise RuntimeError("human_click returned False after overlay removal")
+                return f"已点击文本为 '{text}' 的元素（已自动移除遮挡元素）"
+            except Exception:
+                logger.warning(f"[click_text] Overlay removal didn't resolve, trying force click...")
+                await locator.click(force=True, timeout=3000)
+                return f"已点击文本为 '{text}' 的元素（已自动使用 force 模式）"
+        raise
+    popup = await _check_post_click_popup(page)
+    if popup:
+        return f"已点击文本为 '{text}' 的元素（点击触发了弹窗: {popup}）"
     return f"已点击文本为 '{text}' 的元素"
 
 
@@ -142,20 +400,39 @@ async def fill(selector: str, text: str) -> str:
         text: 要填写的文本内容
     """
     page = get_page()
-    await page.locator(selector).fill(text)
+    await page.locator(selector).fill(text, force=True)
+    _record_interaction(selector)
     return f"已在 {selector} 中填写: {text}"
 
 
 @register_tool
 async def type_text(selector: str, text: str) -> str:
-    """逐字符输入文本到元素。适用于隐藏或动态显示的输入框。
+    """逐字符输入文本到元素。适用于 fill 无效的动态输入框（如 React 受控组件）。
+
+    通过模拟真实键盘输入逐字符触发事件，对 React/Vue 等框架的受控组件兼容性更好。
+    注意：会先全选并删除已有内容（Ctrl+A → Backspace），再逐字符输入新文本。
 
     Args:
         selector: 输入框的 CSS 选择器
         text: 要输入的文本内容
     """
     page = get_page()
-    await page.locator(selector).press_sequentially(text)
+    locator = page.locator(selector)
+    # Click to focus — handle popups that might block the click
+    try:
+        await locator.click(timeout=5000)
+    except Exception as e:
+        err = str(e).lower()
+        if "intercept" in err or "timed out" in err:
+            logger.warning(f"[type_text] Click blocked, removing overlays...")
+            await _remove_overlays(page)
+            await locator.click(force=True, timeout=3000)
+        else:
+            raise
+    await page.keyboard.press("Control+a")
+    await page.keyboard.press("Backspace")
+    await locator.press_sequentially(text, delay=50)
+    _record_interaction(selector)
     return f"已在 {selector} 中输入: {text}"
 
 
@@ -276,14 +553,15 @@ async def analyze_page() -> str:
     会穿透 Shadow DOM 查找所有嵌套元素。当 AI 无法找到目标元素时，
     必须使用此工具获取页面的真实 DOM 结构，而不是依赖训练数据中已知的选择器。
 
-    返回值是 JSON 格式，包含：
-    - inputs: 所有可见输入框（tag, type, name, id, placeholder, selector）
-    - buttons: 所有可见按钮（text, id, selector）
-    - links: 可见链接（text, href），最多 20 条
+    返回值是 JSON 格式，按页面区域（layout）分组展示：
+    - layout: 页面布局概览，按区域列出各类元素数量
+    - areas: 按区域分组的详细元素列表，每个元素含 area、nearby、position 等上下文
     """
     page = get_page()
     return await safe_evaluate(page, """
         (() => {
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
             const isVisible = (el) => {
                 const style = window.getComputedStyle(el);
                 const rect = el.getBoundingClientRect();
@@ -292,20 +570,129 @@ async def analyze_page() -> str:
                        style.opacity !== '0' &&
                        rect.width > 0 && rect.height > 0;
             };
+
+            // Build a unique selector: id > name > nth-child path
             const mkSelector = (el) => {
                 if (el.id) return '#' + CSS.escape(el.id);
                 if (el.name) return '[name="' + el.name.replace(/"/g, '\\\\"') + '"]';
-                if (el.className && typeof el.className === 'string') {
-                    const cls = el.className.trim().split(/\\s+/)[0];
-                    if (cls) return el.tagName.toLowerCase() + '.' + CSS.escape(cls);
+                const parts = [];
+                let cur = el;
+                while (cur && cur !== document.body && cur !== document.documentElement) {
+                    const parent = cur.parentElement;
+                    if (!parent) break;
+                    if (cur.id) {
+                        parts.unshift('#' + CSS.escape(cur.id));
+                        break;
+                    }
+                    const tag = cur.tagName.toLowerCase();
+                    const idx = [...parent.children].indexOf(cur) + 1;
+                    let seg = tag;
+                    if (cur.className && typeof cur.className === 'string') {
+                        const cls = cur.className.trim().split(/\\s+/)[0];
+                        if (cls && !cls.match(/^[0-9]/)) {
+                            seg += '.' + CSS.escape(cls);
+                        }
+                    }
+                    if (parent.children.length > 1) {
+                        seg += ':nth-child(' + idx + ')';
+                    }
+                    parts.unshift(seg);
+                    cur = parent;
                 }
-                return el.tagName.toLowerCase();
+                return parts.join(' > ') || el.tagName.toLowerCase();
             };
 
-            // Collect elements from both light DOM and shadow DOM recursively
+            // Position description: "顶部居中", "左侧", etc.
+            const describePosition = (rect) => {
+                const cx = rect.x + rect.width / 2;
+                const cy = rect.y + rect.height / 2;
+                const hPos = cx < vw * 0.33 ? '左侧' : cx > vw * 0.66 ? '右侧' : '居中';
+                const vPos = cy < vh * 0.33 ? '顶部' : cy > vh * 0.66 ? '底部' : '中部';
+                return vPos + hPos;
+            };
+
+            // Semantic area: determine which page region the element belongs to
+            const getArea = (el) => {
+                let p = el.parentElement;
+                while (p && p !== document.body && p !== document.documentElement) {
+                    const tag = p.tagName.toLowerCase();
+                    if (tag === 'header' || tag === 'nav') return '顶部导航区';
+                    if (tag === 'aside') return '侧边栏';
+                    if (tag === 'footer') return '底部区域';
+                    if (tag === 'main') return '主内容区';
+                    if (tag === 'form') return '表单区';
+                    const role = (p.getAttribute('role') || '').toLowerCase();
+                    if (role === 'navigation') return '顶部导航区';
+                    if (role === 'sidebar' || role === 'complementary') return '侧边栏';
+                    if (role === 'banner') return '顶部导航区';
+                    if (role === 'main') return '主内容区';
+                    if (role === 'search') return '搜索区';
+                    const cls = (typeof p.className === 'string' ? p.className.toLowerCase() : '');
+                    const eid = (p.id || '').toLowerCase();
+                    const combined = cls + ' ' + eid;
+                    if (/sidebar|side-bar|aside|left-panel|left-nav/.test(combined)) return '侧边栏';
+                    if (/header|topbar|top-bar|navbar|nav-bar/.test(combined)) return '顶部导航区';
+                    if (/footer|bottom-bar/.test(combined)) return '底部区域';
+                    if (/searchbar|search-bar|searchbox|search-box|search-form/.test(combined)) return '搜索区';
+                    if (/modal|dialog|popup|overlay/.test(combined)) return '弹窗';
+                    p = p.parentElement;
+                }
+                return '';
+            };
+
+            // Describe neighboring elements for spatial context
+            const getNearby = (el) => {
+                const parts = [];
+                // Previous sibling
+                let prev = el.previousElementSibling;
+                while (prev && parts.length < 2) {
+                    const t = (prev.textContent || '').trim().substring(0, 30);
+                    if (t && prev.tagName.toLowerCase() !== 'script') {
+                        parts.push('前邻:' + prev.tagName.toLowerCase() + '("' + t + '")');
+                        break;
+                    }
+                    prev = prev.previousElementSibling;
+                }
+                // Next sibling
+                let next = el.nextElementSibling;
+                while (next && parts.length < 2) {
+                    const t = (next.textContent || '').trim().substring(0, 30);
+                    if (t && next.tagName.toLowerCase() !== 'script') {
+                        parts.push('后邻:' + next.tagName.toLowerCase() + '("' + t + '")');
+                        break;
+                    }
+                    next = next.nextElementSibling;
+                }
+                // Same form inputs
+                const form = el.closest('form');
+                if (form) {
+                    const formInputs = form.querySelectorAll('input, textarea, select');
+                    const inputDescs = [];
+                    formInputs.forEach(inp => {
+                        if (inp !== el) {
+                            const ph = (inp.placeholder || inp.name || inp.type || '').substring(0, 30);
+                            if (ph) inputDescs.push(inp.tagName.toLowerCase() + '("' + ph + '")');
+                        }
+                    });
+                    if (inputDescs.length > 0) parts.push('同表单: ' + inputDescs.slice(0, 3).join(', '));
+                }
+                // Parent-level input neighbors
+                const parent = el.parentElement;
+                if (parent) {
+                    const siblingInputs = parent.querySelectorAll('input, textarea');
+                    siblingInputs.forEach(inp => {
+                        if (inp !== el) {
+                            const ph = (inp.placeholder || inp.name || inp.type || '').substring(0, 30);
+                            if (ph) parts.push('紧邻输入框: input("' + ph + '")');
+                        }
+                    });
+                }
+                return parts.join('; ');
+            };
+
+            // Collect from both light DOM and shadow DOM
             const collectAll = (root, selector) => {
                 const results = [...root.querySelectorAll(selector)];
-                // Recursively search inside shadow roots
                 const allElements = root.querySelectorAll('*');
                 for (const el of allElements) {
                     if (el.shadowRoot) {
@@ -318,48 +705,175 @@ async def analyze_page() -> str:
             const inputs = collectAll(document, 'input, textarea, select')
                 .filter(isVisible)
                 .slice(0, 30)
-                .map(el => ({
-                    tag: el.tagName.toLowerCase(),
-                    type: el.type || '',
-                    name: el.name || '',
-                    id: el.id || '',
-                    placeholder: (el.placeholder || '').substring(0, 60),
-                    selector: mkSelector(el),
-                    in_shadow_dom: el.getRootNode() !== document
-                }));
-            const buttons = collectAll(document, 'button, input[type="submit"], input[type="button"], [role="button"]')
-                .filter(isVisible)
-                .slice(0, 20)
                 .map(el => {
-                    const hasSvg = el.querySelector('svg') !== null || (el.shadowRoot && el.shadowRoot.querySelector('svg') !== null);
-                    const hasIcon = el.className && /icon|search|menu|close|hamburger/i.test(el.className);
+                    const rect = el.getBoundingClientRect();
                     return {
                         tag: el.tagName.toLowerCase(),
-                        text: (el.textContent || el.value || '').trim().substring(0, 60),
+                        type: el.type || '',
+                        name: el.name || '',
                         id: el.id || '',
-                        aria_label: (el.getAttribute('aria-label') || '').substring(0, 80),
-                        title: (el.getAttribute('title') || '').substring(0, 80),
-                        classes: (typeof el.className === 'string' ? el.className.trim() : '').substring(0, 100),
-                        has_svg: hasSvg,
+                        placeholder: (el.placeholder || '').substring(0, 60),
                         selector: mkSelector(el),
+                        position: describePosition(rect),
+                        area: getArea(el),
+                        nearby: getNearby(el),
                         in_shadow_dom: el.getRootNode() !== document
                     };
                 });
+
+            const buttons = collectAll(document, 'button, input[type="submit"], input[type="button"], [role="button"]')
+                .filter(isVisible)
+                .map(el => ({el, isButton: true}));
+
+            // Also find clickable non-button elements (span, div, etc.) that look like buttons
+            // These are elements with cursor:pointer, tabindex, onclick, or button-like classes
+            const clickableCandidates = collectAll(document,
+                'span, div, li, [tabindex], [onclick], [role="link"]'
+            ).filter(isVisible).filter(el => {
+                // Skip if already in the buttons collection
+                if (/^(button|input|select|textarea|a)$/i.test(el.tagName)) return false;
+                // Skip tiny/invisible text
+                const t = (el.textContent || '').trim();
+                if (!t || t.length > 80) return false;
+                // Skip if it's just a wrapper with many children (layout div)
+                if (el.children.length > 5) return false;
+                // Detect clickable signals
+                const style = window.getComputedStyle(el);
+                const cursor = style.cursor;
+                const tabindex = el.getAttribute('tabindex');
+                const onclick = el.getAttribute('onclick');
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                const cls = (typeof el.className === 'string' ? el.className.toLowerCase() : '');
+                // Is clickable if any signal matches
+                return cursor === 'pointer'
+                    || tabindex !== null
+                    || onclick !== null
+                    || role === 'button' || role === 'link'
+                    || /btn|button|clickable|action|tab|item|menu|nav/.test(cls);
+            }).map(el => ({el, isButton: false}));
+
+            // Merge and deduplicate (by DOM element reference)
+            const allClickable = [...buttons];
+            const seenEls = new Set(buttons.map(b => b.el));
+            clickableCandidates.forEach(c => {
+                // Avoid adding an element whose ancestor is already in the list
+                if (!seenEls.has(c.el)) {
+                    let dominated = false;
+                    for (const s of seenEls) {
+                        if (s.contains(c.el) || c.el.contains(s)) { dominated = true; break; }
+                    }
+                    if (!dominated) {
+                        allClickable.push(c);
+                        seenEls.add(c.el);
+                    }
+                }
+            });
+
+            const mergedButtons = allClickable
+                .slice(0, 30)
+                .map(({el}) => {
+                    const rect = el.getBoundingClientRect();
+                    const hasSvg = el.querySelector('svg') !== null || (el.shadowRoot && el.shadowRoot.querySelector('svg') !== null);
+                    const btnText = (el.textContent || el.value || '').trim().substring(0, 60);
+                    return {
+                        tag: el.tagName.toLowerCase(),
+                        text: btnText,
+                        selector: mkSelector(el),
+                        has_svg: hasSvg,
+                        aria_label: (el.getAttribute('aria-label') || '').substring(0, 80),
+                        title: (el.getAttribute('title') || '').substring(0, 80),
+                        position: describePosition(rect),
+                        area: getArea(el),
+                        nearby: getNearby(el),
+                        in_shadow_dom: el.getRootNode() !== document
+                    };
+                });
+
             const links = collectAll(document, 'a[href]')
                 .filter(isVisible)
                 .slice(0, 20)
-                .map(el => ({
-                    text: (el.textContent || '').trim().substring(0, 60),
-                    href: el.href,
-                    in_shadow_dom: el.getRootNode() !== document
-                }));
+                .map(el => {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                        text: (el.textContent || '').trim().substring(0, 60),
+                        href: el.href,
+                        selector: mkSelector(el),
+                        position: describePosition(rect),
+                        area: getArea(el),
+                        in_shadow_dom: el.getRootNode() !== document
+                    };
+                });
+
+            // Disambiguation: describe context for duplicate-text elements
+            const addDisambiguation = (items, textField = 'text') => {
+                const textCounts = {};
+                items.forEach(item => {
+                    const key = (item[textField] || '').trim();
+                    textCounts[key] = (textCounts[key] || 0) + 1;
+                });
+                items.forEach(item => {
+                    const key = (item[textField] || '').trim();
+                    if (textCounts[key] > 1) {
+                        const parts = ['页面中有' + textCounts[key] + '个"' + key + '"'];
+                        if (item.area) parts.push('此元素在' + item.area);
+                        if (item.nearby) parts.push(item.nearby);
+                        if (!item.area && item.position) parts.push('位于' + item.position);
+                        item.note = parts.join('，');
+                    }
+                });
+            };
+            addDisambiguation(mergedButtons, 'text');
+            addDisambiguation(links, 'text');
+
+            // Build area-grouped structure for clearer spatial reasoning
+            const areaMap = {};
+            const addToArea = (area, category, items) => {
+                if (!items.length) return;
+                if (!areaMap[area]) areaMap[area] = [];
+                items.forEach(item => {
+                    areaMap[area].push(Object.assign({category}, item));
+                });
+            };
+            const seenAreas = new Set();
+            inputs.forEach(el => { if (el.area) seenAreas.add(el.area); });
+            mergedButtons.forEach(el => { if (el.area) seenAreas.add(el.area); });
+            links.forEach(el => { if (el.area) seenAreas.add(el.area); });
+
+            const layout = {};
+            seenAreas.forEach(area => {
+                const areaInputs = inputs.filter(el => el.area === area);
+                const areaButtons = mergedButtons.filter(el => el.area === area);
+                const areaLinks = links.filter(el => el.area === area);
+                const parts = [];
+                if (areaInputs.length) parts.push(areaInputs.length + '个输入框');
+                if (areaButtons.length) parts.push(areaButtons.length + '个按钮');
+                if (areaLinks.length) parts.push(areaLinks.length + '个链接');
+                layout[area] = parts.join('，');
+                addToArea(area, 'input', areaInputs);
+                addToArea(area, 'button', areaButtons);
+                addToArea(area, 'link', areaLinks);
+            });
+            // Elements without area
+            const noAreaInputs = inputs.filter(el => !el.area);
+            const noAreaButtons = mergedButtons.filter(el => !el.area);
+            const noAreaLinks = links.filter(el => !el.area);
+            if (noAreaInputs.length || noAreaButtons.length || noAreaLinks.length) {
+                addToArea('其他区域', 'input', noAreaInputs);
+                addToArea('其他区域', 'button', noAreaButtons);
+                addToArea('其他区域', 'link', noAreaLinks);
+                const parts = [];
+                if (noAreaInputs.length) parts.push(noAreaInputs.length + '个输入框');
+                if (noAreaButtons.length) parts.push(noAreaButtons.length + '个按钮');
+                if (noAreaLinks.length) parts.push(noAreaLinks.length + '个链接');
+                layout['其他区域'] = parts.join('，');
+            }
+
             return JSON.stringify({
                 url: location.href,
                 title: document.title,
-                inputs,
-                buttons,
-                links,
-                counts: {inputs: inputs.length, buttons: buttons.length, links: links.length}
+                layout,
+                areas: areaMap,
+                counts: {inputs: inputs.length, buttons: mergedButtons.length, links: links.length}
             }, null, 2);
         })()
     """)
@@ -425,8 +939,7 @@ async def dismiss_overlay() -> str:
 
     try:
         result = await safe_evaluate(page, js)
-        import json
-        info = json.loads(result)
+        info = _json.loads(result)
         parts = []
         if info["closed"]:
             parts.append(f"已点击关闭按钮: {info['closed']}")
@@ -467,7 +980,9 @@ async def screenshot(name: str = "screenshot") -> str:
     """
     page = get_page()
     path = str(Path(tempfile.gettempdir()) / f"testagent_{name}.png")
-    await page.screenshot(path=path, full_page=True)
+    # full_page=False: only capture visible viewport — avoids timeout on pages
+    # with lazy-loaded content below the fold and font-loading waits.
+    await page.screenshot(path=path, full_page=False, timeout=15000)
     return f"截图已保存到 {path}"
 
 
@@ -584,3 +1099,4 @@ async def configure_browser(
     if nav_failed:
         result += "（警告：页面恢复失败，当前为空白页，请重新 navigate）"
     return result
+

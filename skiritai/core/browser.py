@@ -196,6 +196,18 @@ def _wait_for_cdp(port: int, timeout: float = 10.0) -> bool:
     return False
 
 
+async def _apply_stealth(page) -> None:
+    """Apply playwright-stealth patches to hide automation fingerprints."""
+    try:
+        from playwright_stealth import Stealth
+        await Stealth().apply_stealth_async(page)
+        logger.info("[Browser] Stealth patches applied")
+    except ImportError:
+        logger.warning("[Browser] playwright-stealth not installed, skipping stealth patches")
+    except Exception as e:
+        logger.warning(f"[Browser] Stealth patch failed: {e}")
+
+
 async def launch_browser_server(pw, case_dir: Path, headless: bool | None = None):
     """Launch Chromium as an independent subprocess with CDP enabled.
 
@@ -246,6 +258,9 @@ async def launch_browser_server(pw, case_dir: Path, headless: bool | None = None
     context = browser.contexts[0] if browser.contexts else await browser.new_context()
     page = context.pages[0] if context.pages else await context.new_page()
 
+    # Apply stealth patches to hide automation fingerprints
+    await _apply_stealth(page)
+
     logger.info(f"[Browser] Launched subprocess pid={proc.pid}, CDP port={cdp_port}")
     return cdp_port, browser, context, page
 
@@ -294,6 +309,9 @@ async def connect_to_browser(pw, case_dir: Path):
 
     context = browser.contexts[0] if browser.contexts else await browser.new_context()
     page = context.pages[0] if context.pages else await context.new_page()
+
+    # Apply stealth patches on reconnection as well
+    await _apply_stealth(page)
 
     logger.info(f"[Browser] Reconnected to browser on port {cdp_port}")
     return browser, context, page

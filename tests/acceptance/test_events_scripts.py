@@ -156,7 +156,8 @@ class TestScriptRoundtrip:
             content = ctx.script_path.read_text()
             assert "async def run(page, context):" in content
             assert "page.goto" in content
-            assert "page.click" in content
+            assert "_cdp_click" in content
+            assert "#login" in content
 
     def test_explore_then_replay_roundtrip(self):
         from skiritai.core.ai_context import AIContext

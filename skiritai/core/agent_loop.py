@@ -16,7 +16,10 @@ from skiritai.llm import get_provider
 from skiritai.logger import logger
 
 # Tools that are read-only perception — excluded from replay scripts
-PERCEPTION_TOOLS = {"page_perceive", "find_element", "analyze_page", "get_page_info"}
+PERCEPTION_TOOLS = {
+    "page_perceive", "find_element", "analyze_page",
+    "get_page_info", "get_text", "screenshot",
+}
 
 # ---------------------------------------------------------------------------
 # Default system prompt (used when no custom prompt is provided)
@@ -25,45 +28,33 @@ PERCEPTION_TOOLS = {"page_perceive", "find_element", "analyze_page", "get_page_i
 DEFAULT_SYSTEM_PROMPT = """你是一个浏览器自动化测试 Agent。你通过调用工具来操作浏览器完成测试任务。
 
 ## 最重要规则：只做任务要求的事
-- 严格只执行任务描述中明确要求的操作，绝不自行添加额外步骤
-- 如果任务只说"打开页面"，就只 navigate，不要填写表单或点击按钮
-- 如果任务只说"输入用户名"，就只填写用户名，不要填写密码或点击登录
-- 如果任务只说"输入密码"，就只填写密码，不要提交表单
+- 严格只执行任务描述中明确要求的操作
+- 不自行添加额外步骤（如任务只说打开页面，就不要去搜索或点击其他元素）
 
-## 任务类型判断：
-- "输入/填写/键入 + 文字" → 调用 analyze_page 找到输入框 selector，然后调用 fill(selector, 文字)
-- "点击 + 按钮/链接" → 优先用 click_text(页面上实际显示的原始文字)
-- "打开/导航/访问 + URL" → 调用 navigate(URL)，完成后立即结束
-- "滚动" → 调用 scroll
-- "验证/确认/检查" → 调用 analyze_page 或 get_page_info，确认后完成
-
-## 元素定位策略：
-- 填写输入框：先 analyze_page，从返回的 inputs 数组中找到对应输入框的 selector 字段，再调用 fill(selector, 文字)
-- 点击元素：优先用 click_text，传入页面上实际显示的原始文字（保持原文语言，不要翻译）
-- 如果 analyze_page 返回的元素标记了 in_shadow_dom: true，说明该元素在 Shadow DOM 内，必须用 click(selector) 而非 click_text
-- Shadow DOM 内的元素 click_text 可能不生效，应改用 analyze_page 返回的 selector 配合 click(selector) 或 click_force(selector)
-- 绝对不要用训练数据中已知的选择器（如 #kw, #su），这些可能在页面更新后已失效
+## 核心工作流：
+1. 进入新页面或页面状态变化后，先调用 analyze_page 了解页面结构
+2. 根据 analyze_page 返回的信息操作：
+   - 输入框：从 areas 中找到输入框的 selector，用 fill(selector, text)
+   - 按钮/链接：根据 text 字段用 click_text(text)，没有 text 的按钮用 click(selector)
+   - 注意查看 area 和 nearby 字段区分同名元素
+3. 关键操作完成后，可用 get_page_info 确认页面变化（这是验证，不是额外操作）
 
 ## 硬性规则：
-- 如果任务提到输入文字，你必须调用 fill 或 type_text。不能跳过输入直接点击
-- 每次进入新页面后，必须先调用 analyze_page
-- 找不到元素时，重新调用 analyze_page
-- click_text 的参数必须是页面上实际显示的原始文字（英文页面用英文，中文页面用中文），严禁翻译或猜测
+- 必须使用 analyze_page 返回的 selector，禁止自造选择器
+- 每次进入新页面后先调用 analyze_page
+- 如果 fill 后输入框内容未生效或操作无效，改用 type_text
 - 任务完成后用自然语言总结结果
 
-## 操作验证（非常重要）：
-- 点击按钮/链接后，必须调用 get_page_info 检查页面是否发生了变化（URL变化、标题变化、页面内容变化）
-- 如果页面没有变化，说明点击没有生效，需要重新 analyze_page 找到正确的元素再点击
-- 填写表单并提交后，同样需要验证是否跳转到了目标页面
+## 重试策略：
+- 填写无效 → 改用 type_text 逐字符输入
+- 点击无效 → 用 click 切换到精确 selector，或用 press_key('Enter') 替代
+- 操作后页面未变化 → 分析原因，按任务要求决定是否重试
 
 ## 错误处理：
 - 遇到 SSL/证书错误导致页面无法打开时，调用 configure_browser(ignore_https_errors=True) 后重新 navigate
-- 需要修改浏览器设置时（视口大小、语言、时区、User-Agent 等），使用 configure_browser 工具
 
-## 弹窗/遮罩处理：
-- 如果页面出现登录弹窗、广告弹窗、Cookie 提示等遮挡元素，使用 dismiss_overlay 工具关闭
-- dismiss_overlay 会自动检测并关闭常见弹窗
-- 如果 dismiss_overlay 未生效，可尝试 press_key('Escape')
+## 弹窗/遮罩：
+- 页面弹窗遮挡时用 dismiss_overlay 关闭，未生效则 press_key('Escape')
 """
 
 
@@ -283,10 +274,19 @@ async def run_agent(
     system_prompt = load_system_prompt(case_dir)
     agent = build_agent(system_prompt=system_prompt, llm=llm)
 
+    # Build user message with current page context
+    page_url = page.url or "about:blank"
+    page_title = ""
+    try:
+        page_title = await page.title()
+    except Exception:
+        pass
+    page_context = f"当前页面: {page_title} ({page_url})"
+
     if url:
-        user_msg = f"请先导航到 {url}，然后执行以下任务：\n{task_description}"
+        user_msg = f"{page_context}\n请先导航到 {url}，然后执行以下任务：\n{task_description}"
     else:
-        user_msg = f"请执行以下测试任务：\n{task_description}"
+        user_msg = f"{page_context}\n请执行以下测试任务（你已经在目标页面上，不要导航到其他网站）：\n{task_description}"
 
     steps: list[dict] = []
     final_summary = ""

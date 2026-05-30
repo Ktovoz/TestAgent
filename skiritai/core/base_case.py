@@ -561,7 +561,15 @@ class BaseCase:
                 try:
                     import base64, tempfile
                     path = str(Path(tempfile.gettempdir()) / f"skiritai_error_{step_name}.png")
-                    await self._page.screenshot(path=path, full_page=True)
+                    try:
+                        # full_page=False: avoid timeout on pages with slow font-loading / lazy content
+                        await self._page.screenshot(path=path, full_page=False, timeout=15000)
+                    except Exception:
+                        # CDP fallback for pages with slow fonts
+                        cdp = await self._page.context.new_cdp_session(self._page)
+                        result = await cdp.send("Page.captureScreenshot", {"format": "png"})
+                        with open(path, "wb") as f:
+                            f.write(base64.b64decode(result["data"]))
                     auto_screenshot = {"name": f"error_{step_name}", "path": path}
                     logger.info(f"[Step] Error screenshot saved: {path}")
                 except Exception as se:
